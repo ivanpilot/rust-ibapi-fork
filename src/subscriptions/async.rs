@@ -1,5 +1,6 @@
 //! Asynchronous subscription implementation
 
+use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -9,6 +10,7 @@ use tokio::sync::mpsc;
 use super::common::{process_decode_result, ProcessingResult};
 use super::{ResponseContext, StreamDecoder};
 use crate::client::r#async::Client;
+use crate::market_data::realtime::TickTypes;
 use crate::messages::{OutgoingMessages, RequestMessage, ResponseMessage};
 use crate::transport::AsyncInternalSubscription;
 use crate::Error;
@@ -29,6 +31,7 @@ pub struct Subscription<T> {
     client: Option<Arc<Client>>,
     /// Cancel message generator
     cancel_fn: Option<Arc<CancelFn>>,
+    snapshot_ended: Arc<AtomicBool>,
 }
 
 enum SubscriptionInner<T> {
@@ -73,6 +76,7 @@ impl<T> Clone for Subscription<T> {
             cancelled: self.cancelled.clone(),
             client: self.client.clone(),
             cancel_fn: self.cancel_fn.clone(),
+            snapshot_ended: self.snapshot_ended.clone(),
         }
     }
 }
@@ -104,6 +108,7 @@ impl<T> Subscription<T> {
             cancelled: Arc::new(AtomicBool::new(false)),
             client: Some(client),
             cancel_fn: None,
+            snapshot_ended: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -165,13 +170,53 @@ impl<T> Subscription<T> {
             cancelled: Arc::new(AtomicBool::new(false)),
             client: None,
             cancel_fn: None,
+            snapshot_ended: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Get the next value from the subscription
+    // Get the next value from the subscription
+    // pub async fn next(&mut self) -> Option<Result<T, Error>>
+    // where
+    //     T: 'static,
+    // {
+    //     match &mut self.inner {
+    //         SubscriptionInner::WithDecoder {
+    //             subscription,
+    //             decoder,
+    //             client,
+    //         } => loop {
+    //             match subscription.next().await {
+    //                 Some(mut message) => {
+    //                     let result = decoder(client.server_version(), &mut message);
+    //                     match process_decode_result(result) {
+    //                         ProcessingResult::Success(val) => return Some(Ok(val)),
+    //                         ProcessingResult::EndOfStream => return None,
+    //                         ProcessingResult::Retry => continue,
+    //                         ProcessingResult::Error(err) => return Some(Err(err)),
+    //                     }
+    //                 }
+    //                 None => return None,
+    //             }
+    //         },
+    //         SubscriptionInner::PreDecoded { receiver } => receiver.recv().await,
+    //     }
+    // }
+
+    /// Mark that the snapshot has ended (internal use)
+    pub(crate) fn mark_snapshot_ended(&self) {
+        self.snapshot_ended.store(true, Ordering::Relaxed);
+        // debug!("Snapshot ended for subscription {:?}", self.request_id);
+    }
+
+    /// Check if snapshot has ended (internal use)  
+    pub(crate) fn is_snapshot_ended(&self) -> bool {
+        self.snapshot_ended.load(Ordering::Relaxed)
+    }
+
     pub async fn next(&mut self) -> Option<Result<T, Error>>
     where
-        T: 'static,
+        // T: 'static,
+        T: 'static + Any,
     {
         match &mut self.inner {
             SubscriptionInner::WithDecoder {
@@ -183,16 +228,49 @@ impl<T> Subscription<T> {
                     Some(mut message) => {
                         let result = decoder(client.server_version(), &mut message);
                         match process_decode_result(result) {
-                            ProcessingResult::Success(val) => return Some(Ok(val)),
-                            ProcessingResult::EndOfStream => return None,
+                            // ProcessingResult::Success(val) => return Some(Ok(val)),
+                            ProcessingResult::Success(val) => {
+                                // println!("DEBUG: ProcessingResult::Success reached");
+
+                                // Add this type checking
+                                if let Some(tick_types) = (&val as &dyn std::any::Any).downcast_ref::<TickTypes>() {
+                                    // println!("DEBUG: Successfully cast to TickTypes: {:?}", tick_types);
+
+                                    let is_end = tick_types.is_snapshot_end();
+                                    // println!("DEBUG: is_snapshot_end() = {}", is_end);
+
+                                    if is_end {
+                                        // println!("DEBUG: Calling mark_snapshot_ended()");
+                                        self.mark_snapshot_ended();
+                                    }
+                                }
+                                // else {
+                                // println!("DEBUG: Failed to cast to TickTypes, type is: {}", std::any::type_name::<T>());
+                                // }
+
+                                return Some(Ok(val));
+                            }
+                            ProcessingResult::EndOfStream => {
+                                self.mark_snapshot_ended();
+                                return None;
+                            }
                             ProcessingResult::Retry => continue,
                             ProcessingResult::Error(err) => return Some(Err(err)),
                         }
                     }
-                    None => return None,
+                    None => {
+                        self.mark_snapshot_ended();
+                        return None;
+                    }
                 }
             },
-            SubscriptionInner::PreDecoded { receiver } => receiver.recv().await,
+            SubscriptionInner::PreDecoded { receiver } => match receiver.recv().await {
+                Some(result) => Some(result),
+                None => {
+                    self.mark_snapshot_ended();
+                    None
+                }
+            },
         }
     }
 }
@@ -219,15 +297,63 @@ impl<T> Subscription<T> {
     }
 }
 
+// impl<T> Drop for Subscription<T> {
+//     fn drop(&mut self) {
+//         debug!("dropping async subscription");
+
+//         // Check if already cancelled
+//         if self.cancelled.load(Ordering::Relaxed) {
+//             return;
+//         }
+
+//         self.cancelled.store(true, Ordering::Relaxed);
+
+//         // Try to send cancel message if we have the necessary components
+//         if let (Some(client), Some(cancel_fn)) = (&self.client, &self.cancel_fn) {
+//             let client = client.clone();
+//             let id = self.request_id.or(self.order_id);
+//             let response_context = self.response_context.clone();
+//             let server_version = client.server_version();
+
+//             // Clone the cancel function for use in the spawned task
+//             if let Ok(message) = cancel_fn(server_version, id, Some(&response_context)) {
+//                 // Spawn a task to send the cancel message since drop can't be async
+//                 tokio::spawn(async move {
+//                     if let Err(e) = client.message_bus.send_message(message).await {
+//                         warn!("error sending cancel message in drop: {e}");
+//                     }
+//                 });
+//             }
+//         }
+
+//         // The AsyncInternalSubscription's Drop will handle channel cleanup
+//     }
+// }
+
 impl<T> Drop for Subscription<T> {
     fn drop(&mut self) {
-        debug!("dropping async subscription");
+        // println!(
+        //     "🔍 DROP DEBUG: request_id={:?}, snapshot_ended={}",
+        //     self.request_id,
+        //     self.is_snapshot_ended()
+        // );
+        // debug!("dropping async subscription");
 
         // Check if already cancelled
         if self.cancelled.load(Ordering::Relaxed) {
+            // println!("🔍 DROP DEBUG: Already cancelled, returning early");
             return;
         }
 
+        // 🔥 THE KEY FIX: CHECK IF SNAPSHOT ENDED BEFORE CANCELING
+        if self.is_snapshot_ended() {
+            // debug!("Subscription {:?} snapshot already ended, skipping cancel", self.request_id);
+            // println!("✅ DROP DEBUG: Snapshot ended, skipping cancel");
+            self.cancelled.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        // println!("📤 DROP DEBUG: Sending cancel message");
         self.cancelled.store(true, Ordering::Relaxed);
 
         // Try to send cancel message if we have the necessary components
@@ -239,6 +365,7 @@ impl<T> Drop for Subscription<T> {
 
             // Clone the cancel function for use in the spawned task
             if let Ok(message) = cancel_fn(server_version, id, Some(&response_context)) {
+                // debug!("Sending cancel message for subscription {:?}", id);
                 // Spawn a task to send the cancel message since drop can't be async
                 tokio::spawn(async move {
                     if let Err(e) = client.message_bus.send_message(message).await {

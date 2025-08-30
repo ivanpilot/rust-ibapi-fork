@@ -153,6 +153,10 @@ impl StreamDecoder<TickTypes> for TickTypes {
             _ => Err(Error::NotImplemented),
         }
     }
+
+    fn is_snapshot_end(&self) -> bool {
+        matches!(self, TickTypes::SnapshotEnd)
+    }
 }
 
 // === Public API Functions ===

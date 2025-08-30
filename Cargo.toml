@@ -18,6 +18,7 @@ exclude = [
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+default=["async"]
 # No default features - users must explicitly choose sync or async
 sync = ["dep:crossbeam"]
 async = ["dep:tokio", "dep:futures", "dep:async-trait"]

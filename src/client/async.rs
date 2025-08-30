@@ -38,7 +38,7 @@ impl Drop for Client {
     fn drop(&mut self) {
         debug!("dropping async client");
         // Request shutdown of the message bus synchronously
-        self.message_bus.request_shutdown_sync();
+        // self.message_bus.request_shutdown_sync();
     }
 }
 
@@ -90,6 +90,12 @@ impl Client {
         };
 
         Ok(client)
+    }
+
+    /// Explicitly drops the client
+    pub async fn disconnect(self) {
+        debug!("explicitly disconnecting client");
+        self.message_bus.ensure_shutdown().await;
     }
 
     /// Returns the server version
